@@ -1,281 +1,2 @@
-import json, os, urllib.request as U
-
-E = os.environ["MAKEFUN_ENV_URL"]
-KN = (18, 33, 31, 14, -14, -31, -33, -18)
-KG = (1, -1, 16, -16, 17, 15, -17, -15)
-DG = (17, 15, -17, -15)
-OG = (1, -1, 16, -16)
-VAL = {"p": 100, "n": 320, "b": 330, "r": 500, "q": 900, "k": 0}
-CAP = 90000
-N = [0]
-
-
-class Stop(Exception):
-    pass
-
-
-def post(p, b):
-    r = U.Request(E + p, json.dumps(b).encode(), {"content-type": "application/json"})
-    return json.load(U.urlopen(r))
-
-
-def parse(fen):
-    b = [0] * 128
-    f = fen.split()
-    for i, row in enumerate(f[0].split("/")):
-        x = 0
-        for c in row:
-            if c.isdigit():
-                x += int(c)
-            else:
-                b[(7 - i) * 16 + x] = c
-                x += 1
-    ep = -1
-    if len(f) > 3 and f[3] != "-":
-        ep = (int(f[3][1]) - 1) * 16 + "abcdefgh".index(f[3][0])
-    return b, f[1] == "w", ep
-
-
-def atk(b, s, u):
-    for o in ((-15, -17) if u else (15, 17)):
-        q = s + o
-        if not q & 0x88:
-            p = b[q]
-            if p and p.isupper() == u and p.lower() == "p":
-                return 1
-    for o in KN:
-        q = s + o
-        if not q & 0x88:
-            p = b[q]
-            if p and p.isupper() == u and p.lower() == "n":
-                return 1
-    for o in KG:
-        q = s + o
-        if not q & 0x88:
-            p = b[q]
-            if p and p.isupper() == u and p.lower() == "k":
-                return 1
-    for ds, ts in ((DG, "bq"), (OG, "rq")):
-        for o in ds:
-            q = s + o
-            while not q & 0x88:
-                p = b[q]
-                if p:
-                    if p.isupper() == u and p.lower() in ts:
-                        return 1
-                    break
-                q += o
-    return 0
-
-
-def gen(b, u, ep):
-    M = []
-    for s in range(128):
-        if s & 0x88:
-            continue
-        p = b[s]
-        if not p or p.isupper() != u:
-            continue
-        t = p.lower()
-        if t == "p":
-            d = 16 if u else -16
-            q = s + d
-            if not q & 0x88 and not b[q]:
-                if q >> 4 in (0, 7):
-                    M += [s | q << 8 | i << 16 for i in (2, 3, 4, 5)]
-                else:
-                    M.append(s | q << 8)
-                q2 = s + 2 * d
-                if s >> 4 in (1, 6) and not b[q2]:
-                    M.append(s | q2 << 8)
-            for o in (d - 1, d + 1):
-                q = s + o
-                if q & 0x88:
-                    continue
-                v = b[q]
-                if v and v.isupper() != u:
-                    if q >> 4 in (0, 7):
-                        M += [s | q << 8 | i << 16 for i in (2, 3, 4, 5)]
-                    else:
-                        M.append(s | q << 8)
-                elif q == ep:
-                    M.append(s | q << 8 | 1 << 20)
-        elif t in "nk":
-            for o in (KN if t == "n" else KG):
-                q = s + o
-                if q & 0x88:
-                    continue
-                v = b[q]
-                if not v or v.isupper() != u:
-                    M.append(s | q << 8)
-        else:
-            for dd in ((DG, OG) if t == "q" else ((DG,) if t == "b" else (OG,))):
-                for o in dd:
-                    q = s + o
-                    while not q & 0x88:
-                        v = b[q]
-                        if v:
-                            if v.isupper() != u:
-                                M.append(s | q << 8)
-                            break
-                        M.append(s | q << 8)
-                        q += o
-    return M
-
-
-def mv(b, m):
-    f = m & 255
-    t = (m >> 8) & 255
-    pr = (m >> 16) & 7
-    p = b[f]
-    cs = t - 16 if p.isupper() else t + 16
-    cap = b[t]
-    if (m >> 20) & 1:
-        cap = b[cs]
-        b[cs] = 0
-    b[t] = p if not pr else ("NBRQ" if p.isupper() else "nbrq")[pr - 2]
-    b[f] = 0
-    return f, cap, cs, p
-
-
-def um(b, m, u):
-    f, cap, cs, p = u
-    b[f] = p
-    b[(m >> 8) & 255] = 0 if (m >> 20) & 1 else cap
-    if (m >> 20) & 1:
-        b[cs] = cap
-
-
-def ok(b, m, u):
-    w = mv(b, m)
-    good = not atk(b, b.index("K" if u else "k"), not u)
-    um(b, m, w)
-    return good
-
-
-def ev(b):
-    s = 0
-    for i in range(128):
-        if i & 0x88:
-            continue
-        p = b[i]
-        if not p:
-            continue
-        t = p.lower()
-        u = p.isupper()
-        r = i >> 4
-        x = (r * 8 + (i & 7)) if u else ((7 - r) * 8 + (i & 7))
-        v = VAL[t] + PST[PI[t] * 64 + x]
-        s += v if u else -v
-    return s
-
-
-def order(M, b, kill):
-    def k(m):
-        c = b[(m >> 8) & 255]
-        if c:
-            return -(VAL[c.lower()] * 16 - VAL[b[m & 255].lower()])
-        return 0 if m == kill else 1
-    M.sort(key=k)
-    return M
-
-
-def qs(b, u, ep, a, bt):
-    N[0] += 1
-    if N[0] > CAP:
-        raise Stop
-    s = ev(b) if u else -ev(b)
-    if s >= bt:
-        return s
-    if s > a:
-        a = s
-    for m in order([m for m in gen(b, u, ep) if b[(m >> 8) & 255] or (m >> 16) & 7 or (m >> 20) & 1], b, -1):
-        if not ok(b, m, u):
-            continue
-        w = mv(b, m)
-        x = -qs(b, not u, -1, -bt, -a)
-        um(b, m, w)
-        if x >= bt:
-            return x
-        if x > a:
-            a = x
-    return a
-
-
-def ab(b, u, ep, d, a, bt):
-    N[0] += 1
-    if N[0] > CAP:
-        raise Stop
-    if d < 1:
-        return qs(b, u, ep, a, bt)
-    best = -99999
-    live = 0
-    for m in order(gen(b, u, ep), b, KILL[0]):
-        if not ok(b, m, u):
-            continue
-        live = 1
-        f = m & 255
-        t = (m >> 8) & 255
-        w = mv(b, m)
-        ne = (f + t) >> 1 if abs(t - f) == 32 and not (m >> 16) & 7 else -1
-        x = -ab(b, not u, ne, d - 1, -bt, -a)
-        um(b, m, w)
-        if x > best:
-            best = x
-            if x > a:
-                a = x
-                if a >= bt:
-                    KILL[0] = m
-                    break
-    if not live:
-        return -29000 - d * 40 if atk(b, b.index("K" if u else "k"), not u) else 0
-    return best
-
-
-def uci(m):
-    s = "abcdefgh"
-    f = m & 255
-    t = (m >> 8) & 255
-    r = s[f & 7] + str((f >> 4) + 1) + s[t & 7] + str((t >> 4) + 1)
-    return r + ("nbrq"[(m >> 16) - 2] if (m >> 16) & 7 else "")
-
-
-PST = [ord(c) - 60 for c in "<<<<<<<<DDGJJGDDLLORROLLTTWZZWTT]]_bb_]]ddgjjgddllorrollssssssss06<BB<606<BHHB<6<BHNNHB<BHNTTNHBBHNTTNHB<BHNNHB<6<BHHB<606<BB<606:>BB>:6:>BFFB>:>BFJJFB>BFJNNJFBBFJNNJFB>BFJJFB>:>BFFB>:6:>BB>:6666<<666@@@FF@@@DDDJJDDDHHHNNHHHLLLRRLLLPPPVVPPPTTTZZTTTXXX^^XXX79<>><979<>@@><9<>@CC@><>@CEEC@>>@CEEC@><>@CC@><9<>@@><979<>><97<963369<96300369630--03630-**-0330-**-03630--03696300369<963369<"]
-PI = {c: i for i, c in enumerate("pnbrqk")}
-KILL = [-1]
-
-while 1:
-    g = post("/game", {})
-    if g["status"] == "done":
-        break
-    while g["status"] == "your_move":
-        b, u, ep = parse(g["fen"])
-        best = None
-        moves = g["legal_moves"]
-        N[0] = 0
-        KILL[0] = -1
-        for d in range(1, 9):
-            try:
-                bst = None
-                a = -99999
-                for m in order(gen(b, u, ep), b, KILL[0]):
-                    if not ok(b, m, u):
-                        continue
-                    w = mv(b, m)
-                    x = -ab(b, not u, -1, d - 1, -99999, -a)
-                    um(b, m, w)
-                    if x > a:
-                        a = x
-                        bst = m
-                if bst is not None:
-                    best = bst
-            except Stop:
-                break
-        if best is None or uci(best) not in moves:
-            best = None
-            for m in gen(b, u, ep):
-                if ok(b, m, u) and uci(m) in moves:
-                    best = m
-                    break
-        pick = uci(best) if best is not None else moves[0]
-        g = post("/move", {"game": g["game"], "move": pick})
+#coding:l1
+import lzma;exec(lzma.decompress('\0@\0\06\0\0\0\0\0\0\0hÈ›äËJü3iG|ê\'"Šeçï—Ó;2Lê+.tØXbãøRgÇô§´e"Èæ8˜[ù‰6‚çıTL%”3EöÊKg0ÍØ–/¨l©ÚPËØ†1kH\'ü\\¾Í2ú!4Ç³FÖõÒ}ï~¬µì0„<¯6¶œÁ/‹Â “ÜÎş˜eéö™@IN…¨ƒ)GëoJHu7Ò\naXß×Ê@ÀL^wxë£C­HÖÏÛ“Ü’˜R>’²?=–¢®ºì=`HŠt‰EıÓ—2Ú½RĞWñĞ)lyAxfr\nîĞè-LRHÌÖG	š³•ˆ÷åòKƒ<‘İHé»z0@—\në­Ik¼b¦Q…åo¦óï\\X®Í56\r€¡\'œt¸Uıÿa™UÀ/öuŸ6_Ë>¹Èñpn6§)üŸ]·¾°Â3æëZGoùœÇÍ%Ùˆ¹p½|ŠÍ¿’ù/œÍ:T4> `Õ‰ê\n_ÁîèÚ;	S­Û+UR¶8C~ï~ÒfËs‰ÙÓŒ}8•–Îæá~>½Êx}¼²âÉÛa1™Ñ|,êx×°ß@©±hVeÉ¨bÂJØ8¹U_w#cj×ªÄ`Û/X†|YÅ°æl»/ìĞË©Î¬V§\'<`Ö†™×0¾Æ½‚™3‡Ø"Õ7øHğQµ~ÔƒproÔVŞßÛÉf°Êl\0â®ò‚SÅÕ€ïB™Ëq±ÁÌéb‚~zæÜ¶ÃûúªÇpã(J­ÈV¨f±Ü®Ò|Ë¸ê±\rêŞ\rî,ÓZe05~¬!±’™ìw]ïÌcám-«Ÿ%×Âî3%¤ H–Ë€É¨<±\'zaÓ“ÁÅ½XÑaúõO¹XÁûìR|>ÈÔÜÍ~^I¨Â!xX"Eóä—K­&ÖjI†bhŒØy\0®[½/“ğ¦ùü;!EòsùI;ÓW¶	´¸çÀÕêØâ_O…"ˆ;¸fpı£ÂQ8Ö…’MoRŸÏóÜ±X3ª)† ÿ¡¾\0\'åÍ–ÓøÜ\n!¡¾kÆ Ë¨KË}O¹éÌ8‰äL‚-ú×hsÛo®5=CêìÜŞÅŠSk_;kZ?ák`o=hÙµZ|ì? ø`¯ÀÊä&\rNÁbï$·Èg@ê½?axÔˆ¾w”ÊLÀ4<_Æ;@ŸÅ_x{\'¬t"‡h]ƒ D‰ÛÊ—:œóÛ‡aCæùn·2±½Ñéè½ƒFÈ]·fiÀG1kË´Fc‡IÕ¼ú£A®?@Åİ—< m¥âÍ7Qà0 ºò¯_e,),óœ-eÇg™f¡Â#{§ÓÁ¿ <¨NY›_D©ğ®P0qu°%Ê2òæ\n4ºN¯\0d$«-`÷zî¤¸´£n4ilcaŞÁóì¿Ÿ5w(°»yO{‰|u†s^„•¼2‡[Ò`Ìşêvf@nŞÓçhW¾çD,À8RMiøÂ†0óx`‰°H+Úõş¦Äâçb.\'K[_Œ}ÓrNsuŠ\rûÁOJPÙr]¼¤û›áˆŠª†€X),é™–[ÃÕyèáå(°l4³wáÍŞ”ÂrŸĞá¼ÖªIu+8¶¶çlÿŠÃxõw2ån`4š´JlàÛPo!÷>Lñ•Kf²¯ËÎu´›\0Ğä¬/ùy¬_é£÷û¥M–„çß ÆÙ÷ıUMÕh6Öö÷àØ¢8.-”³É2DX¢1ÒJíÍùnÍQ&ê9n¤#H\n"hAuûBä&9¯x×äÎ½`^îâƒr›àM¦r™½1İtWÒ+TñarÛ‘M D’º[ªúè×Ú*¶¡n_@\nÚ2¡`G¾¿ûÓğaÎÿH.úEÊ…Qe›d!¼ã·WDÑ¶«\'ÚØkY‹uÔ[ÉxcëìçZó|y÷êÆ~ŸÕiÏA‹ÛöòÁjäê5ªîİ±¥²ÏÒmeÏ À°{y¦ËhnI /v88;eĞå¤×«\r\r¹vàı”<ï­™’X•{7.&²_(L‘ÍKˆ%VÛ«BBåK~FÔ”eT_Ş’õ7\0Î¶±ï\'sè>ƒ¶ßäFQÒ\nÀ †ÆOXürpÂ\nÍ€´*ğ²&?å·úNòX2p‡Á¾¼Ñİ*¿\\ˆÈvÙPåş$\rğøÚ¤w´Şü«d¨ª«\\:xp¦FSGÙ	O\\‡R>MNn¦EíÎù–iÙe`<4í$9³qŒrs„ŒÌq2Èë7•+‰çÓ]6`×GêæÊúnBa—¤ÖÛ×UóÎ?I×´ûXÙ& 1•F´~	ÖÊG*i!Ühè´‡z‰¤ü“½qÿëÆáêŞÄ$E6ìóB›U´69Kg×:ßrîªZ™ŒÇàm—úªÅl6Ø´w×öûâm¸‘k£XÄz¯p=RØœ`¯Ñ¿´¸kIŞA´\'”ù|™o‡œu¼ø‡·ø&€:kÚiÃ¸jÚâ\\!Lö8µÜ·Kd?‡Ÿ¶Ë\'´›0¢é8­pÃ:s×•Œ¤¸üõÅ*ÌˆÖ—è 9ˆpÌŠšÉÂË¶"\\Éekld½ßÄFÖw>\'„ùL˜mÏÃ¬"9@4`mŒ2©ôø\nz®ÎFÉ¤ßp¨šÓê<p6ÍZØ•ºÜ1m6—Ù$ÖoÃèóq^¶ —°ø0‹Ÿ!ôïû@Ifó“0ã^vwù1E;¼‚æ½{—ßó²E=Ã±A‰âXšœĞvÃĞªÉŞ”àS[í‘cƒzv^ú	òå°kù÷J:mîs±V”“f=Õ ×T] Æ$€wÌVÄùDÒ‚åVn±±ú3+WqzW×Ãê{MzNÄÔgË\'…	fã$ŸÛD@nÑ/æe-ƒÛàÚ}2¼“j»S(R¿ª†Ã‘Ã¾,â”Åò¢F|6}Çl¥VŸ´Ò"aï¥KL.Ï—¼;Ì|e°ÂHÔlI//CAìÖ6‰ÓRœÑ„êLÁ¸&=ÃîÄx	ïgĞ²èÒŸîjÛ0]-„¤‹%$HŒ‰Œ•ğkÖ’CVúáFú”Õ\0|Ê4ôå’¸*Ôräb:Û\rí.¿}¹ sİÁ´Á°GõË\'2.¹bñqrfäc]ˆxöE|tØsücyÇp@ğD@vz é-‡M‘ï_2¥XèÙñDåÍ;ªò…A}6bS£lóÙ`µ÷â›¥?‡Ë|,u÷¯{LË‘=ZE²_B&h®“BSs¢…O9ù‡Eâpó6ÈSà3ÔfÇAÏL\n”Ú3«·=Šğğs>È0Ú¼|„Íæ%SÇ%ì’ó±9®^Ş}oš“hénÂ×Ğ›ñ½æ©|9d–“*\'¤ñîÎéj©Õ¿¯«P>yM_÷ƒ½OhŸìÁ1Îá%. …eêÈÈ#Ò^aW¼|ĞG=ggÜA/—²ŞO…ü€ó–	;ïèš¤hÆ]«;N#¤}ê~ÇĞÜæ¬·m÷á™väX¢m\nï¢(I·.Ëùd@Z\rÔjA”…ñw× Ú1é<Ë˜¬¹ì°k$´lå³(4Í/º º]×K#ÛNñ6g§Úù‘İîÓ»›C°öö—ÆòoÏ)òÆ‰C»Ó5]ƒb²°¾~2“ÙİjvC¼½8¼,¨Âë‘vYø\r±–Sß»¨C“vßÄ–Õ4éğ¹òçßz´ÿó~H8Â†ZBêµíf·cZÌüb5á¶‡/Æº3¹;ĞÎ;mp«]™T;(r!Î¹hÄ8µ‘«dù$Ğf»\nAè¥Á–ò2”0Nl´»}G"J®2İ»—b;˜±dSƒ€mn@äÏõFYBêÃi@ÃLà„ñ»G	€åŒ¾Ft!}ÇJ\\[ÌÜ\nuöíÉË•¸÷¸‹³™ò3KÉ«xƒÌ,òH;ĞşXÂ\\I›5şÛø.Q²DáûÜ\nøğ åŞ­¼gsTÅm ÄŞb^´:Eå®ò÷0\0"ECÂšÍEåµSÄ\r±<\\j¨ü“¬ş=©)õu­$_Pôßƒœa AEzY\0n’_rhARo¢)B2ê§çÔxÏ–L¨¹wBÈc?8ğüE\0ô ¿èÔñXü}ƒ²¼ óX1é«=Ë«%ÃÀÒKzåù†OHv2ú¹ø%ÙIá‹|ZŸºù^ŸwÅˆ† ª¢_š	¹¶Õ@ÔÂç_Â•zÜ3²2‡\nH1¶à‹{”œwKùDxÈ¶ã¬éZ[Óg…¤SB’Ù¹õ79ç£7~2ˆğ£{µÈõ)H¤‹ÉoXÁ·©ÛßêĞÔn¿*ğ4“¥!:Ü¯ÔÈ´«¿ì‚E4gqª8©²˜ÿ‰ÉSB4·è­œ(N¿÷×ª€7U3·i%bëQMVY†R*Š¼oœ‰’üÙˆ—6yê²#2T<Kz#)cû63-~)k¢ö—!æÎ)¨3‚ ÖÃÃªÍñ¶‡’PsÕl¶§ ®òšK;ş}šü"ìù&ÔšaTâàÃH:÷ä|£¤øÅn˜±Í“±àsßzz*‚øl©•}ÇÖ¿dÍyôÚ»iuÇX›Ë§‡¶fçdâñçĞ¿’ç0£¾øÑ2"oÍ¹¼Ğ¼ÚuÙñØª:¿‡v¸í<yÍ>9ŞVmdâQ±€ &JãE+‚û5\\Ê‡ğ©Y!$å"r|‰v”|+s#ôèy´Ûi@9E,Ó¾äî¯^z««\\£ê­¿Á™~¨ÒÎëÖ?]µÈ'.encode('l1')))
